@@ -25,8 +25,9 @@ class OffPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.cfg = train_cfg
         self.policy_cfg = train_cfg["policy"]
-        self.alg_cfg = train_cfg["algorithm"]
         self.cfg["algorithm"].setdefault("rnd_cfg", None)
+        self.alg_cfg = dict(train_cfg["algorithm"])
+        self.alg_cfg.pop("rnd_cfg", None)
 
         self.device = device
         self.env = env
