@@ -9,6 +9,7 @@ import os
 import time
 import torch
 import warnings
+import gymnasium as gym
 from tensordict import TensorDict
 
 from rsl_rl.algorithms import DQN
@@ -31,6 +32,14 @@ class OffPolicyRunner:
 
         self.device = device
         self.env = env
+        self._keep_action_dim = False
+        # Some Isaac Lab discrete envs expect actions shaped (num_envs, 1) instead of (num_envs,).
+        try:
+            single_action_space = getattr(self.env.unwrapped, "single_action_space", None)
+            if isinstance(single_action_space, (gym.spaces.Discrete, gym.spaces.MultiDiscrete)):
+                self._keep_action_dim = True
+        except Exception:
+            self._keep_action_dim = False
 
         self._configure_multi_gpu()
 
@@ -67,29 +76,67 @@ class OffPolicyRunner:
 
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
-        for it in range(start_it, total_it):
-            start = time.time()
-            with torch.inference_mode():
-                for _ in range(self.cfg["num_steps_per_env"]):
+        episode_count = start_it
+        while episode_count < total_it:
+            collect_time = 0.0
+            learn_time = 0.0
+            loss_dict = {"q": 0.0}
+            steps_in_episode = 0
+
+            # Run until at least one episode finishes
+            while True:
+                with torch.inference_mode():
+                    start = time.time()
                     actions = self.alg.act(obs)
-                    env_actions = actions.squeeze(-1) if actions.dim() == 2 and actions.shape[-1] == 1 else actions
+                    env_actions = actions
+                    if not self._keep_action_dim and actions.dim() == 2 and actions.shape[-1] == 1:
+                        env_actions = actions.squeeze(-1)
                     obs, rewards, dones, extras = self.env.step(env_actions.to(self.env.device))
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Per-step Q logging for env-0 (exact values, not means).
+                    q_values = getattr(self.alg, "last_q_values", None)
+                    if q_values is not None:
+                        step_log = extras.setdefault("step_log", {})
+                        num_actions = int(q_values.shape[-1])
+                        for a in range(num_actions):
+                            step_log[f"Step/Q/a{a}"] = float(q_values[0, a].item())
+                        action_ids = actions
+                        if action_ids.dim() == 2 and action_ids.shape[-1] == 1:
+                            action_ids = action_ids.squeeze(-1)
+                        step_log["Step/Policy/action_id"] = float(action_ids[0].item())
+                    # Per-step reward/done/timeout logging for env-0.
+                    step_log = extras.setdefault("step_log", {})
+                    step_log["Step/reward"] = float(rewards[0].item())
+                    step_log["Step/done"] = float(dones[0].item())
+                    if "time_outs" in extras:
+                        try:
+                            step_log["Step/time_out"] = float(extras["time_outs"][0].item())
+                        except Exception:
+                            step_log["Step/time_out"] = 0.0
+                    else:
+                        step_log["Step/time_out"] = 0.0
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.logger.process_env_step(rewards, dones, extras, None)
+                    collect_time += time.time() - start
 
-                stop = time.time()
-                collect_time = stop - start
-                start = stop
+                start = time.time()
+                loss_dict = self.alg.update()
+                learn_time += time.time() - start
 
-            loss_dict = self.alg.update()
+                steps_in_episode += 1
+                new_episodes = int(dones.sum().item())
+                if new_episodes > 0:
+                    episode_count += new_episodes
+                    break
 
-            stop = time.time()
-            learn_time = stop - start
-            self.current_learning_iteration = it
+            self.current_learning_iteration = episode_count
+
+            # Use per-episode step count for logging FPS/total steps.
+            original_steps_per_env = self.cfg["num_steps_per_env"]
+            self.cfg["num_steps_per_env"] = steps_in_episode
 
             self.logger.log(
-                it=it,
+                it=episode_count,
                 start_it=start_it,
                 total_it=total_it,
                 collect_time=collect_time,
@@ -98,10 +145,13 @@ class OffPolicyRunner:
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.action_std,
                 rnd_weight=None,
+                epsilon=self.alg.epsilon,
             )
 
-            if it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+            self.cfg["num_steps_per_env"] = original_steps_per_env
+
+            if episode_count % self.cfg["save_interval"] == 0:
+                self.save(os.path.join(self.logger.log_dir, f"model_{episode_count}.pt"))  # type: ignore
 
         if self.logger.log_dir is not None and not self.logger.disable_logs:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))

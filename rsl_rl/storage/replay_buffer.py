@@ -54,14 +54,17 @@ class ReplayBuffer:
         indices = (torch.arange(batch_size, device=self.device) + self.ptr) % self.capacity
 
         for key, value in obs.items():
-            self.observations[key][indices].copy_(value)
+            # NOTE: `tensor[indices]` with a LongTensor performs advanced indexing and returns a copy.
+            # Using `.copy_()` on that result does NOT write back into the replay buffer.
+            # We must use assignment (scatter) to update the underlying storage.
+            self.observations[key][indices] = value
         for key, value in next_obs.items():
-            self.next_observations[key][indices].copy_(value)
+            self.next_observations[key][indices] = value
 
         actions = actions.view(batch_size, *self.actions_shape).to(dtype=torch.long)
-        self.actions[indices].copy_(actions)
-        self.rewards[indices].copy_(rewards.view(batch_size, 1))
-        self.dones[indices].copy_(dones.view(batch_size, 1))
+        self.actions[indices] = actions
+        self.rewards[indices] = rewards.view(batch_size, 1)
+        self.dones[indices] = dones.view(batch_size, 1)
 
         self.ptr = (self.ptr + batch_size) % self.capacity
         self.size = min(self.size + batch_size, self.capacity)

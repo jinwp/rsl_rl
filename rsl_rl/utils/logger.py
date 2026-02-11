@@ -38,6 +38,7 @@ class Logger:
         self.git_status_repos = [rsl_rl.__file__]
         self.tot_timesteps = 0
         self.tot_time = 0
+        self.step_count = 0
 
         # Create buffers
         self.ep_extras = []
@@ -76,6 +77,22 @@ class Logger:
     ) -> None:
         """Add metrics from the environment step to the buffers."""
         if self.log_dir is not None:
+            # Per-step logging (used for debugging; logs exact scalar values each env step).
+            if self.writer and not self.disable_logs and "step_log" in extras:
+                step_idx = self.step_count
+                step_log = extras.get("step_log", {})
+                if isinstance(step_log, dict):
+                    for key, value in step_log.items():
+                        # Only scalars are supported here.
+                        if isinstance(value, torch.Tensor):
+                            if value.numel() != 1:
+                                continue
+                            value = float(value.item())
+                        if isinstance(value, (int, float)):
+                            self.writer.add_scalar(str(key), float(value), step_idx)
+                # One call corresponds to one environment step (vectorized across envs).
+                self.step_count += 1
+
             if "episode" in extras:
                 self.ep_extras.append(extras["episode"])
             elif "log" in extras:
@@ -113,6 +130,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        epsilon: float | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -155,6 +173,8 @@ class Logger:
 
             # Log noise std
             self.writer.add_scalar("Policy/mean_noise_std", action_std.mean().item(), it)
+            if epsilon is not None:
+                self.writer.add_scalar("Policy/epsilon", epsilon, it)
 
             # Log performance
             fps = int(collection_size / (collect_time + learn_time))
@@ -208,6 +228,8 @@ class Logger:
 
             # Print noise std
             log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""
+            if epsilon is not None:
+                log_string += f"""{"Epsilon:":>{pad}} {epsilon:.4f}\n"""
 
             # Print episode extras
             if not print_minimal:

@@ -15,8 +15,6 @@ from rsl_rl.storage.replay_buffer import ReplayBuffer
 
 
 class DQN:
-    """Deep Q-Network algorithm (https://www.nature.com/articles/nature14236)."""
-
     policy: QNetwork
     target_policy: QNetwork
 
@@ -74,7 +72,10 @@ class DQN:
 
         self.last_obs: TensorDict | None = None
         self.last_actions: torch.Tensor | None = None
+        self.last_q_values: torch.Tensor | None = None
         self.intrinsic_rewards = None
+
+        self.has_started_training = False
 
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:
@@ -93,6 +94,8 @@ class DQN:
 
         with torch.no_grad():
             q_values = self.policy(obs)
+            # Cache for runner-side logging without extra forward passes.
+            self.last_q_values = q_values
             greedy_actions = torch.argmax(q_values, dim=-1)
 
         random_mask = torch.rand(greedy_actions.shape, device=self.device) < self.epsilon
@@ -106,6 +109,7 @@ class DQN:
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         with torch.no_grad():
             q_values = self.policy(obs)
+            self.last_q_values = q_values
             actions = torch.argmax(q_values, dim=-1)
         return actions.view(-1, 1)
 
@@ -115,12 +119,27 @@ class DQN:
         if self.last_obs is None or self.last_actions is None:
             raise RuntimeError("process_env_step called before act.")
 
-        self.policy.update_normalization(obs)
-
         done_flags = dones.float()
         if "time_outs" in extras:
-            time_outs = extras["time_outs"].to(done_flags.device).float()
-            done_flags = done_flags * (1.0 - time_outs)
+            time_outs = extras["time_outs"].to(done_flags.device).bool().view(-1)
+
+            # If the environment auto-resets before returning observations, `obs` for time-outs may
+            # correspond to a reset state. Use the pre-reset terminal observation if provided.
+            terminal_obs = extras.get("terminal_observation", None)
+            terminal_ids = extras.get("terminal_observation_ids", None)
+            if terminal_obs is not None:
+                if terminal_ids is None:
+                    terminal_ids = time_outs.nonzero(as_tuple=False).squeeze(-1)
+                if isinstance(terminal_ids, torch.Tensor) and terminal_ids.numel() > 0:
+                    for key in obs.keys():
+                        if key in terminal_obs:
+                            obs[key][terminal_ids] = terminal_obs[key].to(device=obs[key].device)
+
+            # Only zero out done flag if episode was truncated (timeout), not terminated.
+            done_flags = torch.where(time_outs, torch.zeros_like(done_flags), done_flags)
+
+        # Update normalization using the (potentially corrected) next observations.
+        self.policy.update_normalization(obs)
 
         self.storage.add(self.last_obs, self.last_actions, rewards, done_flags, obs)
         self.last_obs = None
@@ -131,10 +150,16 @@ class DQN:
         if len(self.storage) < self.min_buffer_size:
             return {"q": 0.0}
 
+        if not self.has_started_training:
+            print(f"Replay buffer filled ({len(self.storage)} >= {self.min_buffer_size}). Training started!")
+            self.has_started_training = True
+
         if self.total_steps % self.update_every != 0:
             return {"q": 0.0}
 
         mean_loss = 0.0
+        # Debug stats for diagnosing reward/target scaling issues.
+        debug_stats: dict[str, float] = {}
         for _ in range(self.num_gradient_steps):
             obs_batch, actions_batch, rewards_batch, dones_batch, next_obs_batch = self.storage.sample(
                 self.batch_size
@@ -151,7 +176,8 @@ class DQN:
             q_values = self.policy(obs_batch)
             q_sa = q_values.gather(1, actions_batch.long())
 
-            loss = nn.functional.mse_loss(q_sa, targets)
+            # Huber loss is commonly more stable for DQN than MSE.
+            loss = nn.functional.smooth_l1_loss(q_sa, targets)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -166,6 +192,18 @@ class DQN:
             mean_loss += loss.item()
             self.num_updates += 1
 
+            # Store latest batch stats (useful even with num_gradient_steps > 1).
+            debug_stats = {
+                "Debug/rewards_batch_mean": float(rewards_batch.mean().item()),
+                "Debug/rewards_batch_min": float(rewards_batch.min().item()),
+                "Debug/rewards_batch_max": float(rewards_batch.max().item()),
+                "Debug/dones_batch_mean": float(dones_batch.float().mean().item()),
+                "Debug/target_q_mean": float(target_q.mean().item()),
+                "Debug/targets_mean": float(targets.mean().item()),
+                "Debug/q_sa_mean": float(q_sa.mean().item()),
+                "Debug/gamma": float(self.gamma),
+            }
+
             if self.target_update_interval > 0 and self.num_updates % self.target_update_interval == 0:
                 if self.target_update_tau is None:
                     self._update_target()
@@ -173,7 +211,9 @@ class DQN:
                     self._soft_update(self.target_update_tau)
 
         mean_loss /= self.num_gradient_steps
-        return {"q": mean_loss}
+        out = {"q": mean_loss}
+        out.update(debug_stats)
+        return out
 
     def _update_target(self) -> None:
         self.target_policy.load_state_dict(self.policy.state_dict())
